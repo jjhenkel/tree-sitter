@@ -45,6 +45,7 @@ struct TSLexer {
   void (*advance)(TSLexer *, bool);
   void (*mark_end)(TSLexer *);
   uint32_t (*get_column)(TSLexer *);
+  bool (*at_column_zero)(TSLexer *);
   bool (*is_at_included_range_start)(const TSLexer *);
   bool (*eof)(const TSLexer *);
 };

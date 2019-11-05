@@ -181,6 +181,11 @@ static void ts_lexer__mark_end(TSLexer *_self) {
   self->token_end_position = self->current_position;
 }
 
+static bool ts_lexer__at_column_zero(TSLexer *_self) {
+  Lexer *self = (Lexer *)_self;
+  return self->current_position.extent.column == 0;
+}
+
 static uint32_t ts_lexer__get_column(TSLexer *_self) {
   Lexer *self = (Lexer *)_self;
   uint32_t goal_byte = self->current_position.bytes;
@@ -222,6 +227,7 @@ void ts_lexer_init(Lexer *self) {
       // library.
       .advance = ts_lexer__advance,
       .mark_end = ts_lexer__mark_end,
+      .at_column_zero = ts_lexer__at_column_zero,
       .get_column = ts_lexer__get_column,
       .is_at_included_range_start = ts_lexer__is_at_included_range_start,
       .eof = ts_lexer__eof,
