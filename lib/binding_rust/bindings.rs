@@ -132,6 +132,7 @@ pub const TSQueryError_TSQueryErrorSyntax: TSQueryError = 1;
 pub const TSQueryError_TSQueryErrorNodeType: TSQueryError = 2;
 pub const TSQueryError_TSQueryErrorField: TSQueryError = 3;
 pub const TSQueryError_TSQueryErrorCapture: TSQueryError = 4;
+pub const TSQueryError_TSQueryErrorStructure: TSQueryError = 5;
 pub type TSQueryError = u32;
 extern "C" {
     #[doc = " Create a new parser."]
@@ -157,7 +158,7 @@ extern "C" {
     pub fn ts_parser_language(self_: *const TSParser) -> *const TSLanguage;
 }
 extern "C" {
-    #[doc = " Set the spans of text that the parser should include when parsing."]
+    #[doc = " Set the ranges of text that the parser should include when parsing."]
     #[doc = ""]
     #[doc = " By default, the parser will always include entire documents. This function"]
     #[doc = " allows you to parse only a *portion* of a document but still return a syntax"]
@@ -167,7 +168,22 @@ extern "C" {
     #[doc = " The second and third parameters specify the location and length of an array"]
     #[doc = " of ranges. The parser does *not* take ownership of these ranges; it copies"]
     #[doc = " the data, so it doesn\'t matter how these ranges are allocated."]
-    pub fn ts_parser_set_included_ranges(self_: *mut TSParser, ranges: *const TSRange, length: u32);
+    #[doc = ""]
+    #[doc = " If `length` is zero, then the entire document will be parsed. Otherwise,"]
+    #[doc = " the given ranges must be ordered from earliest to latest in the document,"]
+    #[doc = " and they must not overlap. That is, the following must hold for all"]
+    #[doc = " `i` < `length - 1`:"]
+    #[doc = ""]
+    #[doc = "     ranges[i].end_byte <= ranges[i + 1].start_byte"]
+    #[doc = ""]
+    #[doc = " If this requirement is not satisfied, the operation will fail, the ranges"]
+    #[doc = " will not be assigned, and this function will return `false`. On success,"]
+    #[doc = " this function returns `true`"]
+    pub fn ts_parser_set_included_ranges(
+        self_: *mut TSParser,
+        ranges: *const TSRange,
+        length: u32,
+    ) -> bool;
 }
 extern "C" {
     #[doc = " Get the ranges of text that the parser will include when parsing."]
@@ -192,8 +208,8 @@ extern "C" {
     #[doc = " following three fields:"]
     #[doc = " 1. `read`: A function to retrieve a chunk of text at a given byte offset"]
     #[doc = "    and (row, column) position. The function should return a pointer to the"]
-    #[doc = "    text and write its length to the the `bytes_read` pointer. The parser"]
-    #[doc = "    does not take ownership of this buffer; it just borrows it until it has"]
+    #[doc = "    text and write its length to the `bytes_read` pointer. The parser does"]
+    #[doc = "    not take ownership of this buffer; it just borrows it until it has"]
     #[doc = "    finished reading it. The function should write a zero value to the"]
     #[doc = "    `bytes_read` pointer to indicate the end of the document."]
     #[doc = " 2. `payload`: An arbitrary pointer that will be passed to each invocation"]
@@ -252,13 +268,15 @@ extern "C" {
     #[doc = " by default, it will resume where it left off on the next call to"]
     #[doc = " `ts_parser_parse` or other parsing functions. If you don\'t want to resume,"]
     #[doc = " and instead intend to use this parser to parse some other document, you must"]
-    #[doc = " call this `ts_parser_reset` first."]
+    #[doc = " call `ts_parser_reset` first."]
     pub fn ts_parser_reset(self_: *mut TSParser);
 }
 extern "C" {
     #[doc = " Set the maximum duration in microseconds that parsing should be allowed to"]
-    #[doc = " take before halting. If parsing takes longer than this, it will halt early,"]
-    #[doc = " returning NULL. See `ts_parser_parse` for more information."]
+    #[doc = " take before halting."]
+    #[doc = ""]
+    #[doc = " If parsing takes longer than this, it will halt early, returning NULL."]
+    #[doc = " See `ts_parser_parse` for more information."]
     pub fn ts_parser_set_timeout_micros(self_: *mut TSParser, timeout: u64);
 }
 extern "C" {
@@ -266,10 +284,11 @@ extern "C" {
     pub fn ts_parser_timeout_micros(self_: *const TSParser) -> u64;
 }
 extern "C" {
-    #[doc = " Set the parser\'s current cancellation flag pointer. If a non-null pointer is"]
-    #[doc = " assigned, then the parser will periodically read from this pointer during"]
-    #[doc = " parsing. If it reads a non-zero value, it will halt early, returning NULL."]
-    #[doc = " See `ts_parser_parse` for more information."]
+    #[doc = " Set the parser\'s current cancellation flag pointer."]
+    #[doc = ""]
+    #[doc = " If a non-null pointer is assigned, then the parser will periodically read"]
+    #[doc = " from this pointer during parsing. If it reads a non-zero value, it will"]
+    #[doc = " halt early, returning NULL. See `ts_parser_parse` for more information."]
     pub fn ts_parser_set_cancellation_flag(self_: *mut TSParser, flag: *const usize);
 }
 extern "C" {
@@ -294,13 +313,6 @@ extern "C" {
     #[doc = " to pipe these graphs directly to a `dot(1)` process in order to generate"]
     #[doc = " SVG output. You can turn off this logging by passing a negative number."]
     pub fn ts_parser_print_dot_graphs(self_: *mut TSParser, file: ::std::os::raw::c_int);
-}
-extern "C" {
-    #[doc = " Set whether or not the parser should halt immediately upon detecting an"]
-    #[doc = " error. This will generally result in a syntax tree with an error at the"]
-    #[doc = " root, and one or more partial syntax trees within the error. This behavior"]
-    #[doc = " may not be supported long-term."]
-    pub fn ts_parser_halt_on_error(self_: *mut TSParser, halt: bool);
 }
 extern "C" {
     #[doc = " Create a shallow copy of the syntax tree. This is very fast."]
@@ -330,21 +342,21 @@ extern "C" {
     pub fn ts_tree_edit(self_: *mut TSTree, edit: *const TSInputEdit);
 }
 extern "C" {
-    #[doc = " Compare a new syntax tree to a previous syntax tree representing the same"]
+    #[doc = " Compare an old edited syntax tree to a new syntax tree representing the same"]
     #[doc = " document, returning an array of ranges whose syntactic structure has changed."]
     #[doc = ""]
     #[doc = " For this to work correctly, the old syntax tree must have been edited such"]
     #[doc = " that its ranges match up to the new tree. Generally, you\'ll want to call"]
-    #[doc = " this function right after calling one of the `ts_parser_parse` functions,"]
-    #[doc = " passing in the new tree that was returned from `ts_parser_parse` and the old"]
-    #[doc = " tree that was passed as a parameter."]
+    #[doc = " this function right after calling one of the `ts_parser_parse` functions."]
+    #[doc = " You need to pass the old tree that was passed to parse, as well as the new"]
+    #[doc = " tree that was returned from that function."]
     #[doc = ""]
     #[doc = " The returned array is allocated using `malloc` and the caller is responsible"]
     #[doc = " for freeing it using `free`. The length of the array will be written to the"]
     #[doc = " given `length` pointer."]
     pub fn ts_tree_get_changed_ranges(
-        self_: *const TSTree,
         old_tree: *const TSTree,
+        new_tree: *const TSTree,
         length: *mut u32,
     ) -> *mut TSRange;
 }
@@ -401,8 +413,8 @@ extern "C" {
     pub fn ts_node_is_missing(arg1: TSNode) -> bool;
 }
 extern "C" {
-    #[doc = " Check if the node is *missing*. Missing nodes are inserted by the parser in"]
-    #[doc = " order to recover from certain kinds of syntax errors."]
+    #[doc = " Check if the node is *extra*. Extra nodes represent things like comments,"]
+    #[doc = " which are not required the grammar, but can appear anywhere."]
     pub fn ts_node_is_extra(arg1: TSNode) -> bool;
 }
 extern "C" {
@@ -421,6 +433,11 @@ extern "C" {
     #[doc = " Get the node\'s child at the given index, where zero represents the first"]
     #[doc = " child."]
     pub fn ts_node_child(arg1: TSNode, arg2: u32) -> TSNode;
+}
+extern "C" {
+    #[doc = " Get the field name for node's child at the given index, where zero represents"]
+    #[doc = " the first child. Returns NULL, if no field is found."]
+    pub fn ts_node_field_name_for_child(arg1: TSNode, arg2: u32) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
     #[doc = " Get the node\'s number of children."]
@@ -523,7 +540,7 @@ extern "C" {
     pub fn ts_tree_cursor_delete(arg1: *mut TSTreeCursor);
 }
 extern "C" {
-    #[doc = " Re-initialize a tree cursor to start at a different ndoe."]
+    #[doc = " Re-initialize a tree cursor to start at a different node."]
     pub fn ts_tree_cursor_reset(arg1: *mut TSTreeCursor, arg2: TSNode);
 }
 extern "C" {
@@ -561,14 +578,14 @@ extern "C" {
     pub fn ts_tree_cursor_goto_next_sibling(arg1: *mut TSTreeCursor) -> bool;
 }
 extern "C" {
-    #[doc = " Move the cursor to the first schild of its current node."]
+    #[doc = " Move the cursor to the first child of its current node."]
     #[doc = ""]
     #[doc = " This returns `true` if the cursor successfully moved, and returns `false`"]
     #[doc = " if there were no children."]
     pub fn ts_tree_cursor_goto_first_child(arg1: *mut TSTreeCursor) -> bool;
 }
 extern "C" {
-    #[doc = " Move the cursor to the first schild of its current node that extends beyond"]
+    #[doc = " Move the cursor to the first child of its current node that extends beyond"]
     #[doc = " the given byte offset."]
     #[doc = ""]
     #[doc = " This returns the index of the child node if one was found, and returns -1"]
@@ -639,6 +656,9 @@ extern "C" {
     ) -> *const TSQueryPredicateStep;
 }
 extern "C" {
+    pub fn ts_query_step_is_definite(self_: *const TSQuery, byte_offset: u32) -> bool;
+}
+extern "C" {
     #[doc = " Get the name and length of one of the query\'s captures, or one of the"]
     #[doc = " query\'s string literals. Each capture and string is associated with a"]
     #[doc = " numeric id based on the order that it appeared in the query\'s source."]
@@ -656,14 +676,23 @@ extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
-    #[doc = " Disable a certain capture within a query. This prevents the capture"]
-    #[doc = " from being returned in matches, and also avoids any resource usage"]
-    #[doc = " associated with recording the capture."]
+    #[doc = " Disable a certain capture within a query."]
+    #[doc = ""]
+    #[doc = " This prevents the capture from being returned in matches, and also avoids"]
+    #[doc = " any resource usage associated with recording the capture. Currently, there"]
+    #[doc = " is no way to undo this."]
     pub fn ts_query_disable_capture(
         arg1: *mut TSQuery,
         arg2: *const ::std::os::raw::c_char,
         arg3: u32,
     );
+}
+extern "C" {
+    #[doc = " Disable a certain pattern within a query."]
+    #[doc = ""]
+    #[doc = " This prevents the pattern from matching and removes most of the overhead"]
+    #[doc = " associated with the pattern. Currently, there is no way to undo this."]
+    pub fn ts_query_disable_pattern(arg1: *mut TSQuery, arg2: u32);
 }
 extern "C" {
     #[doc = " Create a new cursor for executing a given query."]
@@ -673,7 +702,7 @@ extern "C" {
     #[doc = " to start running a given query on a given syntax node. Then, there are"]
     #[doc = " two options for consuming the results of the query:"]
     #[doc = " 1. Repeatedly call `ts_query_cursor_next_match` to iterate over all of the"]
-    #[doc = "    the *matches* in the order that they were found. Each match contains the"]
+    #[doc = "    *matches* in the order that they were found. Each match contains the"]
     #[doc = "    index of the pattern that matched, and an array of captures. Because"]
     #[doc = "    multiple patterns can match the same set of nodes, one match may contain"]
     #[doc = "    captures that appear *before* some of the captures from a previous match."]
@@ -695,6 +724,16 @@ extern "C" {
 extern "C" {
     #[doc = " Start running a given query on a given node."]
     pub fn ts_query_cursor_exec(arg1: *mut TSQueryCursor, arg2: *const TSQuery, arg3: TSNode);
+}
+extern "C" {
+    #[doc = " Check if this cursor has exceeded its maximum number of in-progress"]
+    #[doc = " matches."]
+    #[doc = ""]
+    #[doc = " Currently, query cursors have a fixed capacity for storing lists"]
+    #[doc = " of in-progress captures. If this capacity is exceeded, then the"]
+    #[doc = " earliest-starting match will silently be dropped to make room for"]
+    #[doc = " further matches."]
+    pub fn ts_query_cursor_did_exceed_match_limit(arg1: *const TSQueryCursor) -> bool;
 }
 extern "C" {
     #[doc = " Set the range of bytes or (row, column) positions in which the query"]
@@ -739,8 +778,10 @@ extern "C" {
 extern "C" {
     #[doc = " Get the numerical id for the given node type string."]
     pub fn ts_language_symbol_for_name(
-        arg1: *const TSLanguage,
-        arg2: *const ::std::os::raw::c_char,
+        self_: *const TSLanguage,
+        string: *const ::std::os::raw::c_char,
+        length: u32,
+        is_named: bool,
     ) -> TSSymbol;
 }
 extern "C" {
@@ -778,5 +819,5 @@ extern "C" {
     pub fn ts_language_version(arg1: *const TSLanguage) -> u32;
 }
 
-pub const TREE_SITTER_LANGUAGE_VERSION: usize = 11;
-pub const TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION: usize = 9;
+pub const TREE_SITTER_LANGUAGE_VERSION: usize = 13;
+pub const TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION: usize = 13;

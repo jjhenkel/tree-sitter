@@ -4,49 +4,53 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, ptr, slice, str};
 use tree_sitter_highlight::{
-    c, Error, HighlightConfiguration, HighlightContext, HighlightEvent, Highlighter, HtmlRenderer,
+    c, Error, Highlight, HighlightConfiguration, HighlightEvent, Highlighter, HtmlRenderer,
 };
 
 lazy_static! {
     static ref JS_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config(&HIGHLIGHTER, "javascript", "injections.scm");
+        get_highlight_config("javascript", Some("injections.scm"), &HIGHLIGHT_NAMES);
+    static ref JSDOC_HIGHLIGHT: HighlightConfiguration =
+        get_highlight_config("jsdoc", None, &HIGHLIGHT_NAMES);
     static ref HTML_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config(&HIGHLIGHTER, "html", "injections.scm");
-    static ref EJS_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config(&HIGHLIGHTER, "embedded-template", "injections-ejs.scm");
-    static ref RUST_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config(&HIGHLIGHTER, "rust", "injections.scm");
-    static ref HIGHLIGHTER: Highlighter = Highlighter::new(
-        [
-            "attribute",
-            "constant",
-            "constructor",
-            "function.builtin",
-            "function",
-            "embedded",
-            "keyword",
-            "operator",
-            "property.builtin",
-            "property",
-            "punctuation",
-            "punctuation.bracket",
-            "punctuation.delimiter",
-            "punctuation.special",
-            "string",
-            "tag",
-            "type.builtin",
-            "type",
-            "variable.builtin",
-            "variable.parameter",
-            "variable",
-        ]
-        .iter()
-        .cloned()
-        .map(String::from)
-        .collect()
+        get_highlight_config("html", Some("injections.scm"), &HIGHLIGHT_NAMES);
+    static ref EJS_HIGHLIGHT: HighlightConfiguration = get_highlight_config(
+        "embedded-template",
+        Some("injections-ejs.scm"),
+        &HIGHLIGHT_NAMES
     );
-    static ref HTML_ATTRS: Vec<String> = HIGHLIGHTER
-        .names()
+    static ref RUST_HIGHLIGHT: HighlightConfiguration =
+        get_highlight_config("rust", Some("injections.scm"), &HIGHLIGHT_NAMES);
+    static ref HIGHLIGHT_NAMES: Vec<String> = [
+        "attribute",
+        "carriage-return",
+        "comment",
+        "constant",
+        "constructor",
+        "function.builtin",
+        "function",
+        "embedded",
+        "keyword",
+        "operator",
+        "property.builtin",
+        "property",
+        "punctuation",
+        "punctuation.bracket",
+        "punctuation.delimiter",
+        "punctuation.special",
+        "string",
+        "tag",
+        "type.builtin",
+        "type",
+        "variable.builtin",
+        "variable.parameter",
+        "variable",
+    ]
+    .iter()
+    .cloned()
+    .map(String::from)
+    .collect();
+    static ref HTML_ATTRS: Vec<String> = HIGHLIGHT_NAMES
         .iter()
         .map(|s| format!("class={}", s))
         .collect();
@@ -320,8 +324,21 @@ fn test_highlighting_empty_lines() {
 }
 
 #[test]
-fn test_highlighting_ejs() {
-    let source = vec!["<div><% foo() %></div>"].join("\n");
+fn test_highlighting_carriage_returns() {
+    let source = "a = \"a\rb\"\r\nb\r";
+
+    assert_eq!(
+        &to_html(&source, &JS_HIGHLIGHT).unwrap(),
+        &[
+            "<span class=variable>a</span> <span class=operator>=</span> <span class=string>&quot;a<span class=carriage-return></span>b&quot;</span>\n",
+            "<span class=variable>b</span>\n",
+        ],
+    );
+}
+
+#[test]
+fn test_highlighting_ejs_with_html_and_javascript() {
+    let source = vec!["<div><% foo() %></div><script> bar() </script>"].join("\n");
 
     assert_eq!(
         &to_token_vector(&source, &EJS_HIGHLIGHT).unwrap(),
@@ -338,7 +355,48 @@ fn test_highlighting_ejs() {
             ("%>", vec!["keyword"]),
             ("</", vec!["punctuation.bracket"]),
             ("div", vec!["tag"]),
-            (">", vec!["punctuation.bracket"])
+            (">", vec!["punctuation.bracket"]),
+            ("<", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+            (" ", vec![]),
+            ("bar", vec!["function"]),
+            ("(", vec!["punctuation.bracket"]),
+            (")", vec!["punctuation.bracket"]),
+            (" ", vec![]),
+            ("</", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+        ]],
+    );
+}
+
+#[test]
+fn test_highlighting_javascript_with_jsdoc() {
+    // Regression test: the middle comment has no highlights. This should not prevent
+    // later injections from highlighting properly.
+    let source = vec!["a /* @see a */ b; /* nothing */ c; /* @see b */"].join("\n");
+
+    assert_eq!(
+        &to_token_vector(&source, &JS_HIGHLIGHT).unwrap(),
+        &[[
+            ("a", vec!["variable"]),
+            (" ", vec![]),
+            ("/* ", vec!["comment"]),
+            ("@see", vec!["comment", "keyword"]),
+            (" a */", vec!["comment"]),
+            (" ", vec![]),
+            ("b", vec!["variable"]),
+            (";", vec!["punctuation.delimiter"]),
+            (" ", vec![]),
+            ("/* nothing */", vec!["comment"]),
+            (" ", vec![]),
+            ("c", vec!["variable"]),
+            (";", vec!["punctuation.delimiter"]),
+            (" ", vec![]),
+            ("/* ", vec!["comment"]),
+            ("@see", vec!["comment", "keyword"]),
+            (" b */", vec!["comment"])
         ]],
     );
 }
@@ -398,12 +456,10 @@ fn test_highlighting_cancellation() {
         test_language_for_injection_string(name)
     };
 
-    // Constructing the highlighter, which eagerly parses the outer document,
-    // should not fail.
-    let mut context = HighlightContext::new();
-    let events = HIGHLIGHTER
+    // The initial `highlight` call, which eagerly parses the outer document, should not fail.
+    let mut highlighter = Highlighter::new();
+    let events = highlighter
         .highlight(
-            &mut context,
             &HTML_HIGHLIGHT,
             source.as_bytes(),
             Some(&cancellation_flag),
@@ -411,14 +467,15 @@ fn test_highlighting_cancellation() {
         )
         .unwrap();
 
-    // Iterating the scopes should not panic. It should return an error
-    // once the cancellation is detected.
+    // Iterating the scopes should not panic. It should return an error once the
+    // cancellation is detected.
     for event in events {
         if let Err(e) = event {
             assert_eq!(e, Error::Cancelled);
             return;
         }
     }
+
     panic!("Expected an error while iterating highlighter");
 }
 
@@ -531,7 +588,7 @@ fn test_highlighting_via_c_api() {
 
 #[test]
 fn test_decode_utf8_lossy() {
-    use tree_sitter_highlight::util::LossyUtf8;
+    use tree_sitter::LossyUtf8;
 
     let parts = LossyUtf8::new(b"hi").collect::<Vec<_>>();
     assert_eq!(parts, vec!["hi"]);
@@ -555,6 +612,7 @@ fn test_language_for_injection_string<'a>(string: &str) -> Option<&'a HighlightC
         "javascript" => Some(&JS_HIGHLIGHT),
         "html" => Some(&HTML_HIGHLIGHT),
         "rust" => Some(&RUST_HIGHLIGHT),
+        "jsdoc" => Some(&JSDOC_HIGHLIGHT),
         _ => None,
     }
 }
@@ -565,15 +623,20 @@ fn to_html<'a>(
 ) -> Result<Vec<String>, Error> {
     let src = src.as_bytes();
     let mut renderer = HtmlRenderer::new();
-    let mut context = HighlightContext::new();
-    let events = HIGHLIGHTER.highlight(
-        &mut context,
+    let mut highlighter = Highlighter::new();
+    let events = highlighter.highlight(
         language_config,
         src,
         None,
         &test_language_for_injection_string,
     )?;
 
+    renderer.set_carriage_return_highlight(
+        HIGHLIGHT_NAMES
+            .iter()
+            .position(|s| s == "carriage-return")
+            .map(Highlight),
+    );
     renderer
         .render(events, src, &|highlight| HTML_ATTRS[highlight.0].as_bytes())
         .unwrap();
@@ -585,12 +648,11 @@ fn to_token_vector<'a>(
     language_config: &'a HighlightConfiguration,
 ) -> Result<Vec<Vec<(&'a str, Vec<&'static str>)>>, Error> {
     let src = src.as_bytes();
-    let mut context = HighlightContext::new();
+    let mut highlighter = Highlighter::new();
     let mut lines = Vec::new();
     let mut highlights = Vec::new();
     let mut line = Vec::new();
-    let events = HIGHLIGHTER.highlight(
-        &mut context,
+    let events = highlighter.highlight(
         language_config,
         src,
         None,
@@ -598,7 +660,7 @@ fn to_token_vector<'a>(
     )?;
     for event in events {
         match event? {
-            HighlightEvent::HighlightStart(s) => highlights.push(HIGHLIGHTER.names()[s.0].as_str()),
+            HighlightEvent::HighlightStart(s) => highlights.push(HIGHLIGHT_NAMES[s.0].as_str()),
             HighlightEvent::HighlightEnd => {
                 highlights.pop();
             }

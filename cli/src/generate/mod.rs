@@ -1,9 +1,10 @@
+mod binding_files;
 mod build_tables;
+mod char_tree;
 mod dedup;
 mod grammars;
 mod nfa;
 mod node_types;
-mod npm_files;
 pub mod parse_grammar;
 mod prepare_grammar;
 mod render;
@@ -31,16 +32,6 @@ lazy_static! {
         .unwrap();
 }
 
-const NEW_HEADER_PARTS: [&'static str; 2] = [
-    "
-  uint32_t large_state_count;
-  const uint16_t *small_parse_table;
-  const uint32_t *small_parse_table_map;",
-    "
-#define SMALL_STATE(id) id - LARGE_STATE_COUNT
-",
-];
-
 struct GeneratedParser {
     c_code: String,
     node_types_json: String,
@@ -50,6 +41,7 @@ pub fn generate_parser_in_directory(
     repo_path: &PathBuf,
     grammar_path: Option<&str>,
     next_abi: bool,
+    generate_bindings: bool,
     report_symbol_name: Option<&str>,
 ) -> Result<()> {
     let src_path = repo_path.join("src");
@@ -97,28 +89,11 @@ pub fn generate_parser_in_directory(
 
     if next_abi {
         write_file(&header_path.join("parser.h"), tree_sitter::PARSER_HEADER)?;
-    } else {
-        let mut header = tree_sitter::PARSER_HEADER.to_string();
-
-        for part in &NEW_HEADER_PARTS {
-            let pos = header
-                .find(part)
-                .expect("Missing expected part of parser.h header");
-            header.replace_range(pos..(pos + part.len()), "");
-        }
-
-        write_file(&header_path.join("parser.h"), header)?;
     }
 
-    ensure_file(&repo_path.join("index.js"), || {
-        npm_files::index_js(&language_name)
-    })?;
-    ensure_file(&src_path.join("binding.cc"), || {
-        npm_files::binding_cc(&language_name)
-    })?;
-    ensure_file(&repo_path.join("binding.gyp"), || {
-        npm_files::binding_gyp(&language_name)
-    })?;
+    if generate_bindings {
+        binding_files::generate_binding_files(&repo_path, &language_name)?;
+    }
 
     Ok(())
 }
@@ -149,7 +124,8 @@ fn generate_parser_for_grammar_with_opts(
     next_abi: bool,
     report_symbol_name: Option<&str>,
 ) -> Result<GeneratedParser> {
-    let variable_info = node_types::get_variable_info(&syntax_grammar, &lexical_grammar)?;
+    let variable_info =
+        node_types::get_variable_info(&syntax_grammar, &lexical_grammar, &simple_aliases)?;
     let node_types_json = node_types::generate_node_types_json(
         &syntax_grammar,
         &lexical_grammar,
@@ -227,12 +203,4 @@ fn write_file(path: &Path, body: impl AsRef<[u8]>) -> Result<()> {
     fs::write(path, body).map_err(Error::wrap(|| {
         format!("Failed to write {:?}", path.file_name().unwrap())
     }))
-}
-
-fn ensure_file<T: AsRef<[u8]>>(path: &PathBuf, f: impl Fn() -> T) -> Result<()> {
-    if path.exists() {
-        Ok(())
-    } else {
-        write_file(path, f().as_ref())
-    }
 }

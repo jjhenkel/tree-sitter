@@ -2,8 +2,8 @@ use super::grammars::{LexicalGrammar, SyntaxGrammar, VariableType};
 use super::rules::{Alias, AliasMap, Symbol, SymbolType};
 use crate::error::{Error, Result};
 use serde_derive::Serialize;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::mem;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ChildType {
@@ -20,7 +20,7 @@ pub(crate) struct FieldInfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VariableInfo {
     pub fields: HashMap<String, FieldInfo>,
-    pub child_types: Vec<ChildType>,
+    pub children: FieldInfo,
     pub children_without_fields: FieldInfo,
     pub has_multi_step_production: bool,
 }
@@ -38,7 +38,7 @@ pub(crate) struct NodeInfoJSON {
     subtypes: Option<Vec<NodeTypeJSON>>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeTypeJSON {
     #[serde(rename = "type")]
     kind: String,
@@ -59,9 +59,19 @@ pub struct ChildQuantity {
     multiple: bool,
 }
 
+impl Default for FieldInfoJSON {
+    fn default() -> Self {
+        FieldInfoJSON {
+            multiple: false,
+            required: true,
+            types: Vec::new(),
+        }
+    }
+}
+
 impl Default for ChildQuantity {
     fn default() -> Self {
-        Self::zero()
+        Self::one()
     }
 }
 
@@ -126,7 +136,7 @@ impl ChildQuantity {
 ///    not associated with fields. Data regarding these children:
 ///    * `types` - The types of named children with no field.
 ///    * `optional` - Do `N` nodes always have at least one named child with no field?
-///    * `multiple` - Can `N` nodes have multiple named child with no field?
+///    * `multiple` - Can `N` nodes have multiple named children with no field?
 ///
 /// Each summary must account for some indirect factors:
 /// 1. hidden nodes. When a parent node `N` has a hidden child `C`, the visible
@@ -137,6 +147,7 @@ impl ChildQuantity {
 pub(crate) fn get_variable_info(
     syntax_grammar: &SyntaxGrammar,
     lexical_grammar: &LexicalGrammar,
+    default_aliases: &AliasMap,
 ) -> Result<Vec<VariableInfo>> {
     let child_type_is_visible = |t: &ChildType| {
         variable_type_for_child_type(t, syntax_grammar, lexical_grammar) >= VariableType::Anonymous
@@ -148,7 +159,7 @@ pub(crate) fn get_variable_info(
 
     // Each variable's summary can depend on the summaries of other hidden variables,
     // and variables can have mutually recursive structure. So we compute the summaries
-    // iteratively, in a loop that terminates only when more changes are possible.
+    // iteratively, in a loop that terminates only when no more changes are possible.
     let mut did_change = true;
     let mut all_initialized = false;
     let mut result = vec![VariableInfo::default(); syntax_grammar.variables.len()];
@@ -158,13 +169,14 @@ pub(crate) fn get_variable_info(
         for (i, variable) in syntax_grammar.variables.iter().enumerate() {
             let mut variable_info = result[i].clone();
 
-            // Within a variable, consider each production separately. For each
-            // production, determine which children and fields can occur, and how many
-            // times they can occur.
-            for (production_index, production) in variable.productions.iter().enumerate() {
-                let mut field_quantities = HashMap::new();
-                let mut children_without_fields_quantity = ChildQuantity::zero();
-                let mut has_uninitialized_invisible_children = false;
+            // Examine each of the variable's productions. The variable's child types can be
+            // immediately combined across all productions, but the child quantities must be
+            // recorded separately for each production.
+            for production in &variable.productions {
+                let mut production_field_quantities = HashMap::new();
+                let mut production_children_quantity = ChildQuantity::zero();
+                let mut production_children_without_fields_quantity = ChildQuantity::zero();
+                let mut production_has_uninitialized_invisible_children = false;
 
                 if production.steps.len() > 1 {
                     variable_info.has_multi_step_production = true;
@@ -174,116 +186,103 @@ pub(crate) fn get_variable_info(
                     let child_symbol = step.symbol;
                     let child_type = if let Some(alias) = &step.alias {
                         ChildType::Aliased(alias.clone())
+                    } else if let Some(alias) = default_aliases.get(&step.symbol) {
+                        ChildType::Aliased(alias.clone())
                     } else {
                         ChildType::Normal(child_symbol)
                     };
 
-                    // Record all of the types of direct children.
-                    did_change |= sorted_vec_insert(&mut variable_info.child_types, &child_type);
+                    let child_is_hidden = !child_type_is_visible(&child_type)
+                        && !syntax_grammar.supertype_symbols.contains(&child_symbol);
 
-                    // Record all of the field names that occur.
+                    // Maintain the set of all child types for this variable, and the quantity of
+                    // visible children in this production.
+                    did_change |=
+                        extend_sorted(&mut variable_info.children.types, Some(&child_type));
+                    if !child_is_hidden {
+                        production_children_quantity.append(ChildQuantity::one());
+                    }
+
+                    // Maintain the set of child types associated with each field, and the quantity
+                    // of children associated with each field in this production.
                     if let Some(field_name) = &step.field_name {
-                        // Record how many times each field occurs in this production.
-                        field_quantities
+                        let field_info = variable_info
+                            .fields
+                            .entry(field_name.clone())
+                            .or_insert(FieldInfo::default());
+                        did_change |= extend_sorted(&mut field_info.types, Some(&child_type));
+
+                        let production_field_quantity = production_field_quantities
                             .entry(field_name)
-                            .or_insert(ChildQuantity::zero())
-                            .append(ChildQuantity::one());
+                            .or_insert(ChildQuantity::zero());
 
-                        // Record the types of children for this field.
-                        let field_info =
-                            variable_info.fields.entry(field_name.clone()).or_insert({
-                                let mut info = FieldInfo {
-                                    types: Vec::new(),
-                                    quantity: ChildQuantity::one(),
-                                };
-
-                                // If this field did *not* occur in an earlier production,
-                                // then it is not required.
-                                if production_index > 0 {
-                                    info.quantity.required = false;
-                                }
-                                info
-                            });
-                        did_change |= sorted_vec_insert(&mut field_info.types, &child_type);
-                    }
-                    // Record named children without fields.
-                    else if child_type_is_named(&child_type) {
-                        // Record how many named children without fields occur in this production.
-                        children_without_fields_quantity.append(ChildQuantity::one());
-
-                        // Record the types of all of the named children without fields.
-                        let children_info = &mut variable_info.children_without_fields;
-                        if children_info.types.is_empty() {
-                            children_info.quantity = ChildQuantity::one();
+                        // Inherit the types and quantities of hidden children associated with fields.
+                        if child_is_hidden && child_symbol.is_non_terminal() {
+                            let child_variable_info = &result[child_symbol.index];
+                            did_change |= extend_sorted(
+                                &mut field_info.types,
+                                &child_variable_info.children.types,
+                            );
+                            production_field_quantity.append(child_variable_info.children.quantity);
+                        } else {
+                            production_field_quantity.append(ChildQuantity::one());
                         }
-                        did_change |= sorted_vec_insert(&mut children_info.types, &child_type);
+                    }
+                    // Maintain the set of named children without fields within this variable.
+                    else if child_type_is_named(&child_type) {
+                        production_children_without_fields_quantity.append(ChildQuantity::one());
+                        did_change |= extend_sorted(
+                            &mut variable_info.children_without_fields.types,
+                            Some(&child_type),
+                        );
                     }
 
-                    // Inherit information from any hidden children.
-                    if child_symbol.is_non_terminal()
-                        && !syntax_grammar.supertype_symbols.contains(&child_symbol)
-                        && step.alias.is_none()
-                        && (!child_type_is_visible(&child_type)
-                            || syntax_grammar.variables_to_inline.contains(&child_symbol))
-                    {
+                    // Inherit all child information from hidden children.
+                    if child_is_hidden && child_symbol.is_non_terminal() {
                         let child_variable_info = &result[child_symbol.index];
 
-                        // If a hidden child can have multiple children, then this
-                        // node can appear to have multiple children.
+                        // If a hidden child can have multiple children, then its parent node can
+                        // appear to have multiple children.
                         if child_variable_info.has_multi_step_production {
                             variable_info.has_multi_step_production = true;
                         }
 
-                        // Inherit fields from this hidden child
+                        // If a hidden child has fields, then the parent node can appear to have
+                        // those same fields.
                         for (field_name, child_field_info) in &child_variable_info.fields {
-                            field_quantities
+                            production_field_quantities
                                 .entry(field_name)
                                 .or_insert(ChildQuantity::zero())
                                 .append(child_field_info.quantity);
-                            let field_info = variable_info
-                                .fields
-                                .entry(field_name.clone())
-                                .or_insert(FieldInfo {
-                                    types: Vec::new(),
-                                    quantity: ChildQuantity::one(),
-                                });
-                            for child_type in &child_field_info.types {
-                                sorted_vec_insert(&mut field_info.types, &child_type);
-                            }
+                            did_change |= extend_sorted(
+                                &mut variable_info
+                                    .fields
+                                    .entry(field_name.clone())
+                                    .or_insert(FieldInfo::default())
+                                    .types,
+                                &child_field_info.types,
+                            );
                         }
 
-                        // Inherit child types from this hidden child
-                        for child_type in &child_variable_info.child_types {
-                            did_change |=
-                                sorted_vec_insert(&mut variable_info.child_types, child_type);
-                        }
+                        // If a hidden child has children, then the parent node can appear to have
+                        // those same children.
+                        production_children_quantity.append(child_variable_info.children.quantity);
+                        did_change |= extend_sorted(
+                            &mut variable_info.children.types,
+                            &child_variable_info.children.types,
+                        );
 
-                        // If any field points to this hidden child, inherit child types
-                        // for the field.
-                        if let Some(field_name) = &step.field_name {
-                            let field_info = variable_info.fields.get_mut(field_name).unwrap();
-                            for child_type in &child_variable_info.child_types {
-                                did_change |= sorted_vec_insert(&mut field_info.types, &child_type);
-                            }
-                        }
-                        // Inherit info about children without fields from this hidden child.
-                        else {
+                        // If a hidden child can have named children without fields, then the parent
+                        // node can appear to have those same children.
+                        if step.field_name.is_none() {
                             let grandchildren_info = &child_variable_info.children_without_fields;
                             if !grandchildren_info.types.is_empty() {
-                                children_without_fields_quantity
-                                    .append(grandchildren_info.quantity);
-
-                                if variable_info.children_without_fields.types.is_empty() {
-                                    variable_info.children_without_fields.quantity =
-                                        ChildQuantity::one();
-                                }
-
-                                for child_type in &grandchildren_info.types {
-                                    did_change |= sorted_vec_insert(
-                                        &mut variable_info.children_without_fields.types,
-                                        &child_type,
-                                    );
-                                }
+                                production_children_without_fields_quantity
+                                    .append(child_variable_info.children_without_fields.quantity);
+                                did_change |= extend_sorted(
+                                    &mut variable_info.children_without_fields.types,
+                                    &child_variable_info.children_without_fields.types,
+                                );
                             }
                         }
                     }
@@ -291,22 +290,27 @@ pub(crate) fn get_variable_info(
                     // Note whether or not this production contains children whose summaries
                     // have not yet been computed.
                     if child_symbol.index >= i && !all_initialized {
-                        has_uninitialized_invisible_children = true;
+                        production_has_uninitialized_invisible_children = true;
                     }
                 }
 
                 // If this production's children all have had their summaries initialized,
                 // then expand the quantity information with all of the possibilities introduced
                 // by this production.
-                if !has_uninitialized_invisible_children {
+                if !production_has_uninitialized_invisible_children {
+                    did_change |= variable_info
+                        .children
+                        .quantity
+                        .union(production_children_quantity);
+
                     did_change |= variable_info
                         .children_without_fields
                         .quantity
-                        .union(children_without_fields_quantity);
+                        .union(production_children_without_fields_quantity);
 
                     for (field_name, info) in variable_info.fields.iter_mut() {
                         did_change |= info.quantity.union(
-                            field_quantities
+                            production_field_quantities
                                 .get(field_name)
                                 .cloned()
                                 .unwrap_or(ChildQuantity::zero()),
@@ -322,15 +326,8 @@ pub(crate) fn get_variable_info(
     }
 
     for supertype_symbol in &syntax_grammar.supertype_symbols {
-        let variable = &syntax_grammar.variables[supertype_symbol.index];
-        if variable.kind != VariableType::Hidden {
-            return Err(Error::grammar(&format!(
-                "Supertype symbols must be hidden, but `{}` is not",
-                variable.name
-            )));
-        }
-
         if result[supertype_symbol.index].has_multi_step_production {
+            let variable = &syntax_grammar.variables[supertype_symbol.index];
             return Err(Error::grammar(&format!(
                 "Supertype symbols must always have a single visible child, but `{}` can have multiple",
                 variable.name
@@ -338,137 +335,31 @@ pub(crate) fn get_variable_info(
         }
     }
 
+    // Update all of the node type lists to eliminate hidden nodes.
     for supertype_symbol in &syntax_grammar.supertype_symbols {
         result[supertype_symbol.index]
-            .child_types
+            .children
+            .types
             .retain(child_type_is_visible);
     }
-
-    // Update all of the node type lists to account for node visiblity:
-    // * Wherever possible, repalce lists of subtypes with their supertypes.
-    // * Remove other hidden node types.
-    for i in 0..result.len() {
-        let mut variable_info = VariableInfo::default();
-        mem::swap(&mut variable_info, &mut result[i]);
-
-        // For each named field, make the `types` list more concise by replacing sets of
-        // subtypes with a single supertype. Also remove any hidden node types.
+    for variable_info in result.iter_mut() {
         for (_, field_info) in variable_info.fields.iter_mut() {
-            for supertype_symbol in &syntax_grammar.supertype_symbols {
-                sorted_vec_replace(
-                    &mut field_info.types,
-                    &result[supertype_symbol.index].child_types,
-                    ChildType::Normal(*supertype_symbol),
-                );
-            }
             field_info.types.retain(child_type_is_visible);
         }
-
-        // Do the same thing for the children without fields.
-        for supertype_symbol in &syntax_grammar.supertype_symbols {
-            sorted_vec_replace(
-                &mut variable_info.children_without_fields.types,
-                &result[supertype_symbol.index].child_types,
-                ChildType::Normal(*supertype_symbol),
-            );
-        }
+        variable_info.fields.retain(|_, v| !v.types.is_empty());
         variable_info
             .children_without_fields
             .types
             .retain(child_type_is_visible);
-
-        result[i] = variable_info;
     }
 
     Ok(result)
 }
 
-fn variable_type_for_child_type(
-    child_type: &ChildType,
-    syntax_grammar: &SyntaxGrammar,
-    lexical_grammar: &LexicalGrammar,
-) -> VariableType {
-    match child_type {
-        ChildType::Aliased(alias) => {
-            if alias.is_named {
-                VariableType::Named
-            } else {
-                VariableType::Anonymous
-            }
-        }
-        ChildType::Normal(symbol) => {
-            if syntax_grammar.supertype_symbols.contains(&symbol) {
-                return VariableType::Named;
-            } else {
-                match symbol.kind {
-                    SymbolType::NonTerminal => syntax_grammar.variables[symbol.index].kind,
-                    SymbolType::Terminal => lexical_grammar.variables[symbol.index].kind,
-                    SymbolType::External => syntax_grammar.external_tokens[symbol.index].kind,
-                    _ => VariableType::Hidden,
-                }
-            }
-        }
-    }
-}
-
-fn sorted_vec_insert<T>(vec: &mut Vec<T>, value: &T) -> bool
-where
-    T: Clone + Eq + Ord,
-{
-    if let Err(i) = vec.binary_search(&value) {
-        vec.insert(i, value.clone());
-        true
-    } else {
-        false
-    }
-}
-
-fn sorted_vec_replace<T>(left: &mut Vec<T>, right: &Vec<T>, value: T) -> bool
-where
-    T: Eq + Ord,
-{
-    if left.len() == 0 {
-        return false;
-    }
-
-    let mut i = 0;
-    for right_elem in right.iter() {
-        while left[i] < *right_elem {
-            i += 1;
-            if i == left.len() {
-                return false;
-            }
-        }
-        if left[i] != *right_elem {
-            return false;
-        }
-    }
-
-    i = 0;
-    left.retain(|left_elem| {
-        if i == right.len() {
-            return true;
-        }
-        while right[i] < *left_elem {
-            i += 1;
-            if i == right.len() {
-                return true;
-            }
-        }
-        right[i] != *left_elem
-    });
-
-    if let Err(i) = left.binary_search(&value) {
-        left.insert(i, value);
-    }
-
-    true
-}
-
 pub(crate) fn generate_node_types_json(
     syntax_grammar: &SyntaxGrammar,
     lexical_grammar: &LexicalGrammar,
-    simple_aliases: &AliasMap,
+    default_aliases: &AliasMap,
     variable_info: &Vec<VariableInfo>,
 ) -> Vec<NodeInfoJSON> {
     let mut node_types_json = BTreeMap::new();
@@ -479,7 +370,7 @@ pub(crate) fn generate_node_types_json(
             named: alias.is_named,
         },
         ChildType::Normal(symbol) => {
-            if let Some(alias) = simple_aliases.get(&symbol) {
+            if let Some(alias) = default_aliases.get(&symbol) {
                 NodeTypeJSON {
                     kind: alias.value.clone(),
                     named: alias.is_named,
@@ -513,31 +404,53 @@ pub(crate) fn generate_node_types_json(
         }
     };
 
+    let populate_field_info_json = |json: &mut FieldInfoJSON, info: &FieldInfo| {
+        if info.types.len() > 0 {
+            json.multiple |= info.quantity.multiple;
+            json.required &= info.quantity.required;
+            json.types
+                .extend(info.types.iter().map(child_type_to_node_type));
+            json.types.sort_unstable();
+            json.types.dedup();
+        } else {
+            json.required = false;
+        }
+    };
+
     let mut aliases_by_symbol = HashMap::new();
-    for (symbol, alias) in simple_aliases {
+    for (symbol, alias) in default_aliases {
         aliases_by_symbol.insert(*symbol, {
             let mut aliases = HashSet::new();
             aliases.insert(Some(alias.clone()));
             aliases
         });
     }
+    for extra_symbol in &syntax_grammar.extra_symbols {
+        if !default_aliases.contains_key(extra_symbol) {
+            aliases_by_symbol
+                .entry(*extra_symbol)
+                .or_insert(HashSet::new())
+                .insert(None);
+        }
+    }
     for variable in &syntax_grammar.variables {
         for production in &variable.productions {
             for step in &production.steps {
-                if !simple_aliases.contains_key(&step.symbol) {
-                    aliases_by_symbol
-                        .entry(step.symbol)
-                        .or_insert(HashSet::new())
-                        .insert(step.alias.clone());
-                }
+                aliases_by_symbol
+                    .entry(step.symbol)
+                    .or_insert(HashSet::new())
+                    .insert(
+                        step.alias
+                            .as_ref()
+                            .or_else(|| default_aliases.get(&step.symbol))
+                            .cloned(),
+                    );
             }
         }
     }
-    aliases_by_symbol.insert(
-        Symbol::non_terminal(0),
-        [None].into_iter().cloned().collect(),
-    );
+    aliases_by_symbol.insert(Symbol::non_terminal(0), [None].iter().cloned().collect());
 
+    let mut subtype_map = Vec::new();
     for (i, info) in variable_info.iter().enumerate() {
         let symbol = Symbol::non_terminal(i);
         let variable = &syntax_grammar.variables[i];
@@ -553,16 +466,22 @@ pub(crate) fn generate_node_types_json(
                         subtypes: None,
                     });
             let mut subtypes = info
-                .child_types
+                .children
+                .types
                 .iter()
                 .map(child_type_to_node_type)
                 .collect::<Vec<_>>();
             subtypes.sort_unstable();
             subtypes.dedup();
+            let supertype = NodeTypeJSON {
+                kind: node_type_json.kind.clone(),
+                named: true,
+            };
+            subtype_map.push((supertype, subtypes.clone()));
             node_type_json.subtypes = Some(subtypes);
-        } else if variable.kind.is_visible()
-            && !syntax_grammar.variables_to_inline.contains(&symbol)
-        {
+        } else if !syntax_grammar.variables_to_inline.contains(&symbol) {
+            // If a rule is aliased under multiple names, then its information
+            // contributes to multiple entries in the final JSON.
             for alias in aliases_by_symbol
                 .get(&Symbol::non_terminal(i))
                 .unwrap_or(&HashSet::new())
@@ -572,95 +491,160 @@ pub(crate) fn generate_node_types_json(
                 if let Some(alias) = alias {
                     kind = &alias.value;
                     is_named = alias.is_named;
-                } else {
+                } else if variable.kind.is_visible() {
                     kind = &variable.name;
                     is_named = variable.kind == VariableType::Named;
+                } else {
+                    continue;
                 }
 
-                let node_type_json =
-                    node_types_json
-                        .entry(kind.clone())
-                        .or_insert_with(|| NodeInfoJSON {
-                            kind: kind.clone(),
-                            named: is_named,
-                            fields: None,
-                            children: None,
-                            subtypes: None,
-                        });
-                let mut fields_json = BTreeMap::new();
-                for (field, field_info) in info.fields.iter() {
-                    let field_info_json =
-                        fields_json.entry(field.clone()).or_insert(FieldInfoJSON {
-                            multiple: false,
-                            required: true,
-                            types: Vec::new(),
-                        });
+                // There may already be an entry with this name, because multiple
+                // rules may be aliased with the same name.
+                let mut node_type_existed = true;
+                let node_type_json = node_types_json.entry(kind.clone()).or_insert_with(|| {
+                    node_type_existed = false;
+                    NodeInfoJSON {
+                        kind: kind.clone(),
+                        named: is_named,
+                        fields: Some(BTreeMap::new()),
+                        children: None,
+                        subtypes: None,
+                    }
+                });
 
-                    field_info_json.multiple |= field_info.quantity.multiple;
-                    field_info_json.required &= field_info.quantity.required;
-                    field_info_json
-                        .types
-                        .extend(field_info.types.iter().map(child_type_to_node_type));
-                    field_info_json.types.sort_unstable();
-                    field_info_json.types.dedup();
-                }
-                node_type_json.fields = Some(fields_json);
-                let mut children_types = info
-                    .children_without_fields
-                    .types
-                    .iter()
-                    .map(child_type_to_node_type)
-                    .collect::<Vec<_>>();
-                if children_types.len() > 0 {
-                    children_types.sort_unstable();
-                    children_types.dedup();
-                    node_type_json.children = Some(FieldInfoJSON {
-                        multiple: info.children_without_fields.quantity.multiple,
-                        required: info.children_without_fields.quantity.required,
-                        types: children_types,
+                let fields_json = node_type_json.fields.as_mut().unwrap();
+                for (new_field, field_info) in info.fields.iter() {
+                    let field_json = fields_json.entry(new_field.clone()).or_insert_with(|| {
+                        // If another rule is aliased with the same name, and does *not* have this field,
+                        // then this field cannot be required.
+                        let mut field_json = FieldInfoJSON::default();
+                        if node_type_existed {
+                            field_json.required = false;
+                        }
+                        field_json
                     });
+                    populate_field_info_json(field_json, field_info);
+                }
+
+                // If another rule is aliased with the same name, any fields that aren't present in this
+                // cannot be required.
+                for (existing_field, field_json) in fields_json.iter_mut() {
+                    if !info.fields.contains_key(existing_field) {
+                        field_json.required = false;
+                    }
+                }
+
+                populate_field_info_json(
+                    node_type_json
+                        .children
+                        .get_or_insert(FieldInfoJSON::default()),
+                    &info.children_without_fields,
+                );
+            }
+        }
+    }
+
+    // Sort the subtype map so that subtypes are listed before their supertypes.
+    subtype_map.sort_by(|a, b| {
+        if b.1.contains(&a.0) {
+            Ordering::Less
+        } else if a.1.contains(&b.0) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    });
+
+    for (_, node_type_json) in node_types_json.iter_mut() {
+        if node_type_json
+            .children
+            .as_ref()
+            .map_or(false, |c| c.types.is_empty())
+        {
+            node_type_json.children = None;
+        }
+
+        if let Some(children) = &mut node_type_json.children {
+            process_supertypes(children, &subtype_map);
+        }
+        if let Some(fields) = &mut node_type_json.fields {
+            for (_, field_info) in fields.iter_mut() {
+                process_supertypes(field_info, &subtype_map);
+            }
+        }
+    }
+
+    let mut anonymous_node_types = Vec::new();
+
+    let empty = HashSet::new();
+    let regular_tokens = lexical_grammar
+        .variables
+        .iter()
+        .enumerate()
+        .flat_map(|(i, variable)| {
+            aliases_by_symbol
+                .get(&Symbol::terminal(i))
+                .unwrap_or(&empty)
+                .iter()
+                .map(move |alias| {
+                    if let Some(alias) = alias {
+                        (&alias.value, alias.kind())
+                    } else {
+                        (&variable.name, variable.kind)
+                    }
+                })
+        });
+    let external_tokens =
+        syntax_grammar
+            .external_tokens
+            .iter()
+            .enumerate()
+            .flat_map(|(i, token)| {
+                aliases_by_symbol
+                    .get(&Symbol::external(i))
+                    .unwrap_or(&empty)
+                    .iter()
+                    .map(move |alias| {
+                        if let Some(alias) = alias {
+                            (&alias.value, alias.kind())
+                        } else {
+                            (&token.name, token.kind)
+                        }
+                    })
+            });
+
+    for (name, kind) in regular_tokens.chain(external_tokens) {
+        match kind {
+            VariableType::Named => {
+                let node_type_json = node_types_json.entry(name.clone()).or_insert(NodeInfoJSON {
+                    kind: name.clone(),
+                    named: true,
+                    fields: None,
+                    children: None,
+                    subtypes: None,
+                });
+                if let Some(children) = &mut node_type_json.children {
+                    children.required = false;
+                }
+                if let Some(fields) = &mut node_type_json.fields {
+                    for (_, field) in fields.iter_mut() {
+                        field.required = false;
+                    }
                 }
             }
+            VariableType::Anonymous => anonymous_node_types.push(NodeInfoJSON {
+                kind: name.clone(),
+                named: false,
+                fields: None,
+                children: None,
+                subtypes: None,
+            }),
+            _ => {}
         }
     }
 
     let mut result = node_types_json.into_iter().map(|e| e.1).collect::<Vec<_>>();
-
-    for (i, variable) in lexical_grammar.variables.iter().enumerate() {
-        for alias in aliases_by_symbol
-            .get(&Symbol::terminal(i))
-            .unwrap_or(&HashSet::new())
-        {
-            let kind;
-            let is_named;
-            if let Some(alias) = alias {
-                kind = &alias.value;
-                is_named = alias.is_named;
-            } else {
-                kind = &variable.name;
-                is_named = variable.kind == VariableType::Named;
-            }
-
-            if variable.kind == VariableType::Named {
-                result.push(NodeInfoJSON {
-                    kind: kind.clone(),
-                    named: is_named,
-                    fields: None,
-                    children: None,
-                    subtypes: None,
-                });
-            } else if variable.kind == VariableType::Anonymous {
-                result.push(NodeInfoJSON {
-                    kind: kind.clone(),
-                    named: is_named,
-                    fields: None,
-                    children: None,
-                    subtypes: None,
-                });
-            }
-        }
-    }
-
+    result.extend(anonymous_node_types.into_iter());
     result.sort_unstable_by(|a, b| {
         b.subtypes
             .is_some()
@@ -676,6 +660,56 @@ pub(crate) fn generate_node_types_json(
     result
 }
 
+fn process_supertypes(
+    info: &mut FieldInfoJSON,
+    subtype_map: &Vec<(NodeTypeJSON, Vec<NodeTypeJSON>)>,
+) {
+    for (supertype, subtypes) in subtype_map {
+        if info.types.contains(supertype) {
+            info.types.retain(|t| !subtypes.contains(t));
+        }
+    }
+}
+
+fn variable_type_for_child_type(
+    child_type: &ChildType,
+    syntax_grammar: &SyntaxGrammar,
+    lexical_grammar: &LexicalGrammar,
+) -> VariableType {
+    match child_type {
+        ChildType::Aliased(alias) => alias.kind(),
+        ChildType::Normal(symbol) => {
+            if syntax_grammar.supertype_symbols.contains(&symbol) {
+                VariableType::Named
+            } else if syntax_grammar.variables_to_inline.contains(&symbol) {
+                VariableType::Hidden
+            } else {
+                match symbol.kind {
+                    SymbolType::NonTerminal => syntax_grammar.variables[symbol.index].kind,
+                    SymbolType::Terminal => lexical_grammar.variables[symbol.index].kind,
+                    SymbolType::External => syntax_grammar.external_tokens[symbol.index].kind,
+                    _ => VariableType::Hidden,
+                }
+            }
+        }
+    }
+}
+
+fn extend_sorted<'a, T>(vec: &mut Vec<T>, values: impl IntoIterator<Item = &'a T>) -> bool
+where
+    T: Clone + Eq + Ord,
+    T: 'a,
+{
+    values.into_iter().any(|value| {
+        if let Err(i) = vec.binary_search(&value) {
+            vec.insert(i, value.clone());
+            true
+        } else {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,12 +723,13 @@ mod tests {
     fn test_node_types_simple() {
         let node_types = get_node_types(InputGrammar {
             name: String::new(),
-            extra_symbols: Vec::new(),
-            external_tokens: Vec::new(),
-            expected_conflicts: Vec::new(),
-            variables_to_inline: Vec::new(),
             word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
             supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
             variables: vec![
                 Variable {
                     name: "v1".to_string(),
@@ -709,8 +744,17 @@ mod tests {
                     kind: VariableType::Named,
                     rule: Rule::string("x"),
                 },
+                // This rule is not reachable from the start symbol
+                // so it won't be present in the node_types
+                Variable {
+                    name: "v3".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::string("y"),
+                },
             ],
         });
+
+        assert_eq!(node_types.len(), 3);
 
         assert_eq!(
             node_types[0],
@@ -772,14 +816,122 @@ mod tests {
     }
 
     #[test]
+    fn test_node_types_simple_extras() {
+        let node_types = get_node_types(InputGrammar {
+            name: String::new(),
+            extra_symbols: vec![Rule::named("v3")],
+            word_token: None,
+            external_tokens: vec![],
+            supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
+            variables: vec![
+                Variable {
+                    name: "v1".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![
+                        Rule::field("f1".to_string(), Rule::named("v2")),
+                        Rule::field("f2".to_string(), Rule::string(";")),
+                    ]),
+                },
+                Variable {
+                    name: "v2".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::string("x"),
+                },
+                // This rule is not reachable from the start symbol, but
+                // it is reachable from the 'extra_symbols' so it
+                // should be present in the node_types
+                Variable {
+                    name: "v3".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::string("y"),
+                },
+            ],
+        });
+
+        assert_eq!(node_types.len(), 4);
+
+        assert_eq!(
+            node_types[0],
+            NodeInfoJSON {
+                kind: "v1".to_string(),
+                named: true,
+                subtypes: None,
+                children: None,
+                fields: Some(
+                    vec![
+                        (
+                            "f1".to_string(),
+                            FieldInfoJSON {
+                                multiple: false,
+                                required: true,
+                                types: vec![NodeTypeJSON {
+                                    kind: "v2".to_string(),
+                                    named: true,
+                                }]
+                            }
+                        ),
+                        (
+                            "f2".to_string(),
+                            FieldInfoJSON {
+                                multiple: false,
+                                required: true,
+                                types: vec![NodeTypeJSON {
+                                    kind: ";".to_string(),
+                                    named: false,
+                                }]
+                            }
+                        ),
+                    ]
+                    .into_iter()
+                    .collect()
+                )
+            }
+        );
+        assert_eq!(
+            node_types[1],
+            NodeInfoJSON {
+                kind: ";".to_string(),
+                named: false,
+                subtypes: None,
+                children: None,
+                fields: None
+            }
+        );
+        assert_eq!(
+            node_types[2],
+            NodeInfoJSON {
+                kind: "v2".to_string(),
+                named: true,
+                subtypes: None,
+                children: None,
+                fields: None
+            }
+        );
+        assert_eq!(
+            node_types[3],
+            NodeInfoJSON {
+                kind: "v3".to_string(),
+                named: true,
+                subtypes: None,
+                children: None,
+                fields: None
+            }
+        );
+    }
+
+    #[test]
     fn test_node_types_with_supertypes() {
         let node_types = get_node_types(InputGrammar {
             name: String::new(),
-            extra_symbols: Vec::new(),
-            external_tokens: Vec::new(),
-            expected_conflicts: Vec::new(),
-            variables_to_inline: Vec::new(),
             word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
             supertype_symbols: vec!["_v2".to_string()],
             variables: vec![
                 Variable {
@@ -862,12 +1014,13 @@ mod tests {
     fn test_node_types_for_children_without_fields() {
         let node_types = get_node_types(InputGrammar {
             name: String::new(),
-            extra_symbols: Vec::new(),
-            external_tokens: Vec::new(),
-            expected_conflicts: Vec::new(),
-            variables_to_inline: Vec::new(),
             word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
             supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
             variables: vec![
                 Variable {
                     name: "v1".to_string(),
@@ -957,15 +1110,72 @@ mod tests {
     }
 
     #[test]
+    fn test_node_types_with_inlined_rules() {
+        let node_types = get_node_types(InputGrammar {
+            name: String::new(),
+            word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
+            supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            precedence_orderings: vec![],
+            variables_to_inline: vec!["v2".to_string()],
+            variables: vec![
+                Variable {
+                    name: "v1".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![Rule::named("v2"), Rule::named("v3")]),
+                },
+                // v2 should not appear in the node types, since it is inlined
+                Variable {
+                    name: "v2".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::alias(Rule::string("a"), "x".to_string(), true),
+                },
+                Variable {
+                    name: "v3".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::string("b"),
+                },
+            ],
+        });
+
+        assert_eq!(
+            node_types[0],
+            NodeInfoJSON {
+                kind: "v1".to_string(),
+                named: true,
+                subtypes: None,
+                children: Some(FieldInfoJSON {
+                    multiple: true,
+                    required: true,
+                    types: vec![
+                        NodeTypeJSON {
+                            kind: "v3".to_string(),
+                            named: true,
+                        },
+                        NodeTypeJSON {
+                            kind: "x".to_string(),
+                            named: true,
+                        },
+                    ]
+                }),
+                fields: Some(BTreeMap::new()),
+            }
+        );
+    }
+
+    #[test]
     fn test_node_types_for_aliased_nodes() {
         let node_types = get_node_types(InputGrammar {
             name: String::new(),
-            extra_symbols: Vec::new(),
-            external_tokens: Vec::new(),
-            expected_conflicts: Vec::new(),
-            variables_to_inline: Vec::new(),
             word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
             supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
             variables: vec![
                 Variable {
                     name: "thing".to_string(),
@@ -1036,12 +1246,13 @@ mod tests {
     fn test_node_types_with_multiple_valued_fields() {
         let node_types = get_node_types(InputGrammar {
             name: String::new(),
-            extra_symbols: Vec::new(),
-            external_tokens: Vec::new(),
-            expected_conflicts: Vec::new(),
-            variables_to_inline: Vec::new(),
             word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
             supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
             variables: vec![
                 Variable {
                     name: "a".to_string(),
@@ -1096,6 +1307,225 @@ mod tests {
                     .into_iter()
                     .collect()
                 ),
+            }
+        );
+    }
+
+    #[test]
+    fn test_node_types_with_fields_on_hidden_tokens() {
+        let node_types = get_node_types(InputGrammar {
+            name: String::new(),
+            word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
+            supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
+            variables: vec![Variable {
+                name: "script".to_string(),
+                kind: VariableType::Named,
+                rule: Rule::seq(vec![
+                    Rule::field("a".to_string(), Rule::pattern("hi")),
+                    Rule::field("b".to_string(), Rule::pattern("bye")),
+                ]),
+            }],
+        });
+
+        assert_eq!(
+            node_types,
+            [NodeInfoJSON {
+                kind: "script".to_string(),
+                named: true,
+                fields: Some(BTreeMap::new()),
+                children: None,
+                subtypes: None
+            }]
+        );
+    }
+
+    #[test]
+    fn test_node_types_with_multiple_rules_same_alias_name() {
+        let node_types = get_node_types(InputGrammar {
+            name: String::new(),
+            word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
+            supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
+            variables: vec![
+                Variable {
+                    name: "script".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::choice(vec![
+                        Rule::named("a"),
+                        // Rule `b` is aliased as rule `a`
+                        Rule::alias(Rule::named("b"), "a".to_string(), true),
+                    ]),
+                },
+                Variable {
+                    name: "a".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![
+                        Rule::field("f1".to_string(), Rule::string("1")),
+                        Rule::field("f2".to_string(), Rule::string("2")),
+                    ]),
+                },
+                Variable {
+                    name: "b".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![
+                        Rule::field("f2".to_string(), Rule::string("22")),
+                        Rule::field("f2".to_string(), Rule::string("222")),
+                        Rule::field("f3".to_string(), Rule::string("3")),
+                    ]),
+                },
+            ],
+        });
+
+        assert_eq!(
+            &node_types
+                .iter()
+                .map(|t| t.kind.as_str())
+                .collect::<Vec<_>>(),
+            &["a", "script", "1", "2", "22", "222", "3"]
+        );
+
+        assert_eq!(
+            &node_types[0..2],
+            &[
+                // A combination of the types for `a` and `b`.
+                NodeInfoJSON {
+                    kind: "a".to_string(),
+                    named: true,
+                    subtypes: None,
+                    children: None,
+                    fields: Some(
+                        vec![
+                            (
+                                "f1".to_string(),
+                                FieldInfoJSON {
+                                    multiple: false,
+                                    required: false,
+                                    types: vec![NodeTypeJSON {
+                                        kind: "1".to_string(),
+                                        named: false,
+                                    }]
+                                }
+                            ),
+                            (
+                                "f2".to_string(),
+                                FieldInfoJSON {
+                                    multiple: true,
+                                    required: true,
+                                    types: vec![
+                                        NodeTypeJSON {
+                                            kind: "2".to_string(),
+                                            named: false,
+                                        },
+                                        NodeTypeJSON {
+                                            kind: "22".to_string(),
+                                            named: false,
+                                        },
+                                        NodeTypeJSON {
+                                            kind: "222".to_string(),
+                                            named: false,
+                                        }
+                                    ]
+                                },
+                            ),
+                            (
+                                "f3".to_string(),
+                                FieldInfoJSON {
+                                    multiple: false,
+                                    required: false,
+                                    types: vec![NodeTypeJSON {
+                                        kind: "3".to_string(),
+                                        named: false,
+                                    }]
+                                }
+                            ),
+                        ]
+                        .into_iter()
+                        .collect()
+                    ),
+                },
+                NodeInfoJSON {
+                    kind: "script".to_string(),
+                    named: true,
+                    subtypes: None,
+                    // Only one node
+                    children: Some(FieldInfoJSON {
+                        multiple: false,
+                        required: true,
+                        types: vec![NodeTypeJSON {
+                            kind: "a".to_string(),
+                            named: true,
+                        }]
+                    }),
+                    fields: Some(BTreeMap::new()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_node_types_with_tokens_aliased_to_match_rules() {
+        let node_types = get_node_types(InputGrammar {
+            name: String::new(),
+            word_token: None,
+            extra_symbols: vec![],
+            external_tokens: vec![],
+            supertype_symbols: vec![],
+            expected_conflicts: vec![],
+            variables_to_inline: vec![],
+            precedence_orderings: vec![],
+            variables: vec![
+                Variable {
+                    name: "a".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![Rule::named("b"), Rule::named("c")]),
+                },
+                // Ordinarily, `b` nodes have two named `c` children.
+                Variable {
+                    name: "b".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::seq(vec![Rule::named("c"), Rule::string("B"), Rule::named("c")]),
+                },
+                Variable {
+                    name: "c".to_string(),
+                    kind: VariableType::Named,
+                    rule: Rule::choice(vec![
+                        Rule::string("C"),
+                        // This token is aliased as a `b`, which will produce a `b` node
+                        // with no children.
+                        Rule::alias(Rule::string("D"), "b".to_string(), true),
+                    ]),
+                },
+            ],
+        });
+
+        assert_eq!(
+            node_types.iter().map(|n| &n.kind).collect::<Vec<_>>(),
+            &["a", "b", "c", "B", "C"]
+        );
+        assert_eq!(
+            node_types[1],
+            NodeInfoJSON {
+                kind: "b".to_string(),
+                named: true,
+                subtypes: None,
+                children: Some(FieldInfoJSON {
+                    multiple: true,
+                    required: false,
+                    types: vec![NodeTypeJSON {
+                        kind: "c".to_string(),
+                        named: true,
+                    }]
+                }),
+                fields: Some(BTreeMap::new()),
             }
         );
     }
@@ -1158,6 +1588,7 @@ mod tests {
                 vec![],
             ),
             &build_lexical_grammar(),
+            &AliasMap::new(),
         )
         .unwrap();
 
@@ -1192,6 +1623,71 @@ mod tests {
                         ChildType::Normal(Symbol::terminal(2)),
                         ChildType::Normal(Symbol::terminal(3)),
                     ],
+                }
+            )]
+            .into_iter()
+            .collect::<HashMap<_, _>>()
+        );
+    }
+
+    #[test]
+    fn test_get_variable_info_with_repetitions_inside_fields() {
+        let variable_info = get_variable_info(
+            &build_syntax_grammar(
+                vec![
+                    // Field associated with a repetition.
+                    SyntaxVariable {
+                        name: "rule0".to_string(),
+                        kind: VariableType::Named,
+                        productions: vec![
+                            Production {
+                                dynamic_precedence: 0,
+                                steps: vec![ProductionStep::new(Symbol::non_terminal(1))
+                                    .with_field_name("field1")],
+                            },
+                            Production {
+                                dynamic_precedence: 0,
+                                steps: vec![],
+                            },
+                        ],
+                    },
+                    // Repetition node
+                    SyntaxVariable {
+                        name: "_rule0_repeat".to_string(),
+                        kind: VariableType::Hidden,
+                        productions: vec![
+                            Production {
+                                dynamic_precedence: 0,
+                                steps: vec![ProductionStep::new(Symbol::terminal(1))],
+                            },
+                            Production {
+                                dynamic_precedence: 0,
+                                steps: vec![
+                                    ProductionStep::new(Symbol::non_terminal(1)),
+                                    ProductionStep::new(Symbol::non_terminal(1)),
+                                ],
+                            },
+                        ],
+                    },
+                ],
+                vec![],
+            ),
+            &build_lexical_grammar(),
+            &AliasMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            variable_info[0].fields,
+            vec![(
+                "field1".to_string(),
+                FieldInfo {
+                    quantity: ChildQuantity {
+                        exists: true,
+                        required: false,
+                        multiple: true,
+                    },
+                    types: vec![ChildType::Normal(Symbol::terminal(1))],
                 }
             )]
             .into_iter()
@@ -1238,6 +1734,7 @@ mod tests {
                 vec![],
             ),
             &build_lexical_grammar(),
+            &AliasMap::new(),
         )
         .unwrap();
 
@@ -1258,7 +1755,6 @@ mod tests {
             .collect::<HashMap<_, _>>()
         );
 
-        //
         assert_eq!(
             variable_info[0].children_without_fields,
             FieldInfo {
@@ -1312,6 +1808,7 @@ mod tests {
                 vec![Symbol::non_terminal(1)],
             ),
             &build_lexical_grammar(),
+            &AliasMap::new(),
         )
         .unwrap();
 
@@ -1334,13 +1831,14 @@ mod tests {
     }
 
     fn get_node_types(grammar: InputGrammar) -> Vec<NodeInfoJSON> {
-        let (syntax_grammar, lexical_grammar, _, simple_aliases) =
+        let (syntax_grammar, lexical_grammar, _, default_aliases) =
             prepare_grammar(&grammar).unwrap();
-        let variable_info = get_variable_info(&syntax_grammar, &lexical_grammar).unwrap();
+        let variable_info =
+            get_variable_info(&syntax_grammar, &lexical_grammar, &default_aliases).unwrap();
         generate_node_types_json(
             &syntax_grammar,
             &lexical_grammar,
-            &simple_aliases,
+            &default_aliases,
             &variable_info,
         )
     }

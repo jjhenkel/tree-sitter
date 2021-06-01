@@ -68,6 +68,7 @@ impl<'a> Minimizer<'a> {
                             ..
                         } => {
                             if !self.simple_aliases.contains_key(&symbol)
+                                && !self.syntax_grammar.supertype_symbols.contains(&symbol)
                                 && !aliased_symbols.contains(&symbol)
                                 && self.syntax_grammar.variables[symbol.index].kind
                                     != VariableType::Named
@@ -365,6 +366,14 @@ impl<'a> Minimizer<'a> {
         existing_tokens: impl Iterator<Item = &'b Symbol>,
         new_token: Symbol,
     ) -> bool {
+        if new_token == Symbol::end_of_nonterminal_extra() {
+            info!(
+                "split states {} {} - end of non-terminal extra",
+                left_id, right_id,
+            );
+            return true;
+        }
+
         // Do not add external tokens; they could conflict lexically with any of the state's
         // existing lookahead tokens.
         if new_token.is_external() {
